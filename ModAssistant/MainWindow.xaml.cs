@@ -1,23 +1,12 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
-using System.Collections.ObjectModel;
 using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Data;
-using System.Windows.Documents;
 using System.Windows.Input;
-using System.Windows.Media;
-using System.Windows.Media.Imaging;
-using System.Windows.Navigation;
-using System.Net;
-using System.IO;
-using System.Web.Script.Serialization;
-using System.Runtime.Serialization;
 using ModAssistant.Pages;
-using System.Reflection;
+using static ModAssistant.Http;
 
 namespace ModAssistant
 {
@@ -28,7 +17,10 @@ namespace ModAssistant
     {
         public static MainWindow Instance;
         public static bool ModsOpened = false;
+        public static bool ModsLoading = false;
         public static string GameVersion;
+        public static string GameVersionOverride;
+        public TaskCompletionSource<bool> VersionLoadStatus = new TaskCompletionSource<bool>();
 
         public string MainText
         {
@@ -47,9 +39,19 @@ namespace ModAssistant
             InitializeComponent();
             Instance = this;
 
+            const int ContentWidth = 1280;
+            const int ContentHeight = 720;
+
+            double ChromeWidth = SystemParameters.WindowNonClientFrameThickness.Left + SystemParameters.WindowNonClientFrameThickness.Right;
+            double ChromeHeight = SystemParameters.WindowNonClientFrameThickness.Top + SystemParameters.WindowNonClientFrameThickness.Bottom;
+            double ResizeBorder = SystemParameters.ResizeFrameVerticalBorderWidth;
+
+            Width = ChromeWidth + ContentWidth + 2 * ResizeBorder;
+            Height = ChromeHeight + ContentHeight + 2 * ResizeBorder;
+
             VersionText.Text = App.Version;
 
-            if (Utils.isVoid())
+            if (Utils.IsVoid())
             {
                 Main.Content = Invalid.Instance;
                 MainWindow.Instance.ModsButton.IsEnabled = false;
@@ -60,40 +62,12 @@ namespace ModAssistant
                 return;
             }
 
-            List<string> versions;
-            string json = string.Empty;
-            HttpWebRequest request = (HttpWebRequest)WebRequest.Create(Utils.Constants.BeatModsAPIUrl + "version");
-            request.AutomaticDecompression = DecompressionMethods.GZip;
-            request.UserAgent = "ModAssistant/" + App.Version;
+            Themes.LoadThemes();
+            Themes.FirstLoad(Properties.Settings.Default.SelectedTheme);
 
-            versions = null;
-            try
-            {
-                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
-                using (Stream stream = response.GetResponseStream())
-                using (StreamReader reader = new StreamReader(stream))
-                {
-                    JavaScriptSerializer serializer = new JavaScriptSerializer();
-                    versions = serializer.Deserialize<string[]>(reader.ReadToEnd()).ToList();
-                }
+            Task.Run(() => LoadVersionsAsync());
 
-                GameVersion = GetGameVersion(versions);
-
-                GameVersionsBox.ItemsSource = versions;
-                GameVersionsBox.SelectedValue = GameVersion;
-            }
-            catch (Exception e)
-            {
-                GameVersionsBox.IsEnabled = false;
-                MessageBox.Show("Could not load game versions, Mods tab will be unavailable.\n" + e);
-            }
-
-            if (!String.IsNullOrEmpty(GameVersion) && Properties.Settings.Default.Agreed)
-            {
-                MainWindow.Instance.ModsButton.IsEnabled = true;
-            }
-
-            if (!Properties.Settings.Default.Agreed || String.IsNullOrEmpty(Properties.Settings.Default.LastTab))
+            if (!Properties.Settings.Default.Agreed || string.IsNullOrEmpty(Properties.Settings.Default.LastTab))
             {
                 Main.Content = Intro.Instance;
             }
@@ -105,15 +79,14 @@ namespace ModAssistant
                         Main.Content = Intro.Instance;
                         break;
                     case "Mods":
-                        Mods.Instance.LoadMods();
-                        ModsOpened = true;
-                        Main.Content = Mods.Instance;
+                        _ = ShowModsPage();
                         break;
                     case "About":
                         Main.Content = About.Instance;
                         break;
                     case "Options":
                         Main.Content = Options.Instance;
+                        Themes.LoadThemes();
                         break;
                     default:
                         Main.Content = Intro.Instance;
@@ -122,12 +95,80 @@ namespace ModAssistant
             }
         }
 
-        private string GetGameVersion(List<string> versions)
+        /* Force the app to shutdown when The main window is closed.
+         *
+         * Explaination:
+         * OneClickStatus is initialized as a static object,
+         * so the window will exist, even if it is unused.
+         * This would cause Mod Assistant to not shutdown,
+         * because technically a window was still open.
+         */
+        protected override void OnClosed(EventArgs e)
+        {
+            base.OnClosed(e);
+
+            Application.Current.Shutdown();
+        }
+
+        private async void LoadVersionsAsync()
+        {
+            try
+            {
+                var resp = await HttpClient.GetAsync(Utils.Constants.BeatModsVersions);
+                var body = await resp.Content.ReadAsStringAsync();
+                List<string> versions = JsonSerializer.Deserialize<string[]>(body).ToList();
+
+                resp = await HttpClient.GetAsync(Utils.Constants.BeatModsAlias);
+                body = await resp.Content.ReadAsStringAsync();
+                object jsonObject = JsonSerializer.DeserializeObject(body);
+
+                Dispatcher.Invoke(() =>
+                {
+                    GameVersion = GetGameVersion(versions, jsonObject);
+
+                    GameVersionsBox.ItemsSource = versions;
+                    GameVersionsBox.SelectedValue = GameVersion;
+
+                    if (!string.IsNullOrEmpty(GameVersionOverride))
+                    {
+                        GameVersionsBox.Visibility = Visibility.Collapsed;
+                        GameVersionsBoxOverride.Visibility = Visibility.Visible;
+                        GameVersionsBoxOverride.Text = GameVersionOverride;
+                        GameVersionsBoxOverride.IsEnabled = false;
+                    }
+
+                    if (!string.IsNullOrEmpty(GameVersion) && Properties.Settings.Default.Agreed)
+                    {
+                        MainWindow.Instance.ModsButton.IsEnabled = true;
+                    }
+                });
+
+                VersionLoadStatus.SetResult(true);
+            }
+            catch (Exception e)
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    GameVersionsBox.IsEnabled = false;
+                    MessageBox.Show($"{Application.Current.FindResource("MainWindow:GameVersionLoadFailed")}\n{e}");
+                });
+
+                VersionLoadStatus.SetResult(false);
+            }
+        }
+
+        private string GetGameVersion(List<string> versions, object aliases)
         {
             string version = Utils.GetVersion();
-            if (!String.IsNullOrEmpty(version) && versions.Contains(version))
+            if (!string.IsNullOrEmpty(version) && versions.Contains(version))
             {
                 return version;
+            }
+
+            string aliasOf = CheckAliases(versions, aliases, version);
+            if (!string.IsNullOrEmpty(aliasOf))
+            {
+                return aliasOf;
             }
 
             string versionsString = String.Join(",", versions.ToArray());
@@ -135,33 +176,73 @@ namespace ModAssistant
             {
                 Properties.Settings.Default.AllGameVersions = versionsString;
                 Properties.Settings.Default.Save();
-                Utils.ShowMessageBoxAsync("It looks like there's been a game update.\n\nPlease double check that the correct version is selected at the bottom left corner!", "New Game Version Detected!");
+
+                string title = (string)Application.Current.FindResource("MainWindow:GameUpdateDialog:Title");
+                string line1 = (string)Application.Current.FindResource("MainWindow:GameUpdateDialog:Line1");
+                string line2 = (string)Application.Current.FindResource("MainWindow:GameUpdateDialog:Line2");
+
+                Utils.ShowMessageBoxAsync($"{line1}\n\n{line2}", title);
                 return versions[0];
             }
 
-            if (!String.IsNullOrEmpty(Properties.Settings.Default.GameVersion) && versions.Contains(Properties.Settings.Default.GameVersion))
+            if (!string.IsNullOrEmpty(Properties.Settings.Default.GameVersion) && versions.Contains(Properties.Settings.Default.GameVersion))
                 return Properties.Settings.Default.GameVersion;
             return versions[0];
         }
 
-        private void ModsButton_Click(object sender, RoutedEventArgs e)
+        private string CheckAliases(List<string> versions, object aliases, string detectedVersion)
         {
-            Main.Content = Mods.Instance;
-            Properties.Settings.Default.LastTab = "Mods";
-            Properties.Settings.Default.Save();
-
-            if (!ModsOpened)
+            Dictionary<string, object> Objects = (Dictionary<string, object>)aliases;
+            foreach (string version in versions)
             {
-                Mods.Instance.LoadMods();
-                ModsOpened = true;
+                object[] aliasArray = (object[])Objects[version];
+                foreach (object alias in aliasArray)
+                {
+                    if (alias.ToString() == detectedVersion)
+                    {
+                        GameVersionOverride = detectedVersion;
+                        return version;
+                    }
+                }
+            }
+            return string.Empty;
+        }
+
+        private async Task ShowModsPage()
+        {
+            void OpenModsPage()
+            {
+                Main.Content = Mods.Instance;
+                Properties.Settings.Default.LastTab = "Mods";
+                Properties.Settings.Default.Save();
+                Mods.Instance.RefreshColumns();
+            }
+
+            if (ModsOpened == true && Mods.Instance.PendingChanges == false)
+            {
+                OpenModsPage();
                 return;
             }
 
-            if (Mods.Instance.PendingChanges)
+            Main.Content = Loading.Instance;
+
+            if (ModsLoading) return;
+            ModsLoading = true;
+            await Mods.Instance.LoadMods();
+            ModsLoading = false;
+
+            if (ModsOpened == false) ModsOpened = true;
+            if (Mods.Instance.PendingChanges == true) Mods.Instance.PendingChanges = false;
+
+            if (Main.Content == Loading.Instance)
             {
-                Mods.Instance.LoadMods();
-                Mods.Instance.PendingChanges = false;
+                OpenModsPage();
             }
+        }
+
+        private void ModsButton_Click(object sender, RoutedEventArgs e)
+        {
+            _ = ShowModsPage();
         }
 
         private void IntroButton_Click(object sender, RoutedEventArgs e)
@@ -181,6 +262,7 @@ namespace ModAssistant
         private void OptionsButton_Click(object sender, RoutedEventArgs e)
         {
             Main.Content = Options.Instance;
+            Themes.LoadThemes();
             Properties.Settings.Default.LastTab = "Options";
             Properties.Settings.Default.Save();
         }
@@ -194,14 +276,14 @@ namespace ModAssistant
         {
             if ((Mods.ModListItem)Mods.Instance.ModsListView.SelectedItem == null)
             {
-                MessageBox.Show("No mod selected");
+                MessageBox.Show((string)Application.Current.FindResource("MainWindow:NoModSelected"));
                 return;
             }
             Mods.ModListItem mod = ((Mods.ModListItem)Mods.Instance.ModsListView.SelectedItem);
             string infoUrl = mod.ModInfo.link;
-            if (String.IsNullOrEmpty(infoUrl))
+            if (string.IsNullOrEmpty(infoUrl))
             {
-                MessageBox.Show(mod.ModName + " does not have an info page");
+                MessageBox.Show(string.Format((string)Application.Current.FindResource("MainWindow:NoModInfoPage"), mod.ModName));
             }
             else
             {
@@ -209,20 +291,25 @@ namespace ModAssistant
             }
         }
 
-        private void GameVersionsBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        private async void GameVersionsBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
             string oldGameVersion = GameVersion;
-            
+
             GameVersion = (sender as ComboBox).SelectedItem.ToString();
-            
-            if (String.IsNullOrEmpty(oldGameVersion)) return;
+
+            if (string.IsNullOrEmpty(oldGameVersion)) return;
 
             Properties.Settings.Default.GameVersion = GameVersion;
             Properties.Settings.Default.Save();
 
             if (ModsOpened)
             {
-                Mods.Instance.LoadMods();
+                var prevPage = Main.Content;
+
+                Mods.Instance.PendingChanges = true;
+                await ShowModsPage();
+
+                Main.Content = prevPage;
             }
         }
 
@@ -232,6 +319,20 @@ namespace ModAssistant
             About.Instance.PatButton.IsEnabled = true;
             About.Instance.HugUp.IsOpen = false;
             About.Instance.HugButton.IsEnabled = true;
+        }
+
+        private void Window_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            if (Main.Content == Mods.Instance)
+            {
+                Mods.Instance.RefreshColumns();
+            }
+        }
+
+        private void BackgroundVideo_MediaEnded(object sender, RoutedEventArgs e)
+        {
+            BackgroundVideo.Position = TimeSpan.Zero;
+            BackgroundVideo.Play();
         }
     }
 }
